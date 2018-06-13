@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <sys/times.h>
+#include <sys/mman.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,11 +22,10 @@
 #include "spookyhash_api.h"
 
 /*
- * gcc -Wall -Wpedantic -I/mnt/git/spookyhash/src -g -O2 -o /tmp/ls lockscale.c /mnt/git/spookyhash/build/bin/Release/libspookyhash.a
+ * gcc -Wall -Wpedantic -I/mnt/git/spookyhash/src -g -O2 -o /tmp/ls lockscale.c /mnt/git/spookyhash/build/bin/Release/libspookyhash.a -lm
  */
 
-#define MIN_REPEAT 10
-#define REPEAT 100
+#define SECONDS 10
 #define BUSY 1000000L
 #define IDLE 10000L
 
@@ -270,7 +270,8 @@ static int lock_sysv(void *c, const char *name, bool lock)
 	sb.sem_flg = 0;
 
 	if (semop(sl->semid, &sb, 1) == -1) {
-		perror("semop");
+		if (errno != EINTR)
+			perror("semop");
 		return -errno;
 	}
 	return 0;
@@ -313,6 +314,7 @@ static int timespec_subtract (struct timespec *result,
 static bool stop = false;
 void sig_handler(int _unused)
 {
+//	fprintf(stderr, "ouch %d\n", getpid());
 	stop = true;
 }
 
@@ -365,15 +367,22 @@ static void free_lock_ctx(struct lock_ctx *lc)
 struct options {
 	long busy;
 	long idle;
-	int repeat;
+	int seconds;
 	int workers;
+	int time;
+	long total;
+	long mini;
+	long maxi;
+	double avg;
+	double stddev;
 };
 
-static void worker(const struct lock_ctx *ctx, const struct options *opts)
+static void worker(const struct lock_ctx *ctx, const struct options *opts,
+		   long *result)
 {
-	static const char NAME[] = "test du sepp";
+	static const char NAME[] = "lockscale test";
 
-	int i, n, rc;
+	int i, rc;
 	const struct timespec wt = {
 		.tv_sec = opts->idle / BILLION,
 		.tv_nsec = opts->idle % BILLION,
@@ -384,15 +393,16 @@ static void worker(const struct lock_ctx *ctx, const struct options *opts)
 	};
 	pid_t me = getpid();
 
-	for (i = 0, n = 0; i < opts->repeat && !stop;  i++) {
-		if (ctx->ops->lock(ctx->ctx, NAME, true) == -1) {
-			if (errno == EINTR)
+	for (i = 0; !stop;  i++) {
+		rc = ctx->ops->lock(ctx->ctx, NAME, true);
+		if (rc != 0) {
+			if (rc == -EINTR)
 				continue;
 			fprintf(stderr, "%s(%d): %s in lock\n", __func__, me,
-			       strerror(errno));
+				strerror(-rc));
 			return;
 		}
-		n++;
+		(*result)++;
 		if (opts->busy < 0)
 			rc = busywait(-opts->busy);
 		else
@@ -404,7 +414,8 @@ static void worker(const struct lock_ctx *ctx, const struct options *opts)
 			fprintf(stderr, "%s(%d): %s in busy\n", __func__, me,
 			       strerror(errno));
 			return;
-		}
+		} else
+			ctx->ops->lock(ctx->ctx, NAME, false);
 		if (nanosleep(&wt, NULL) == -1) {
 			if (errno == EINTR)
 				continue;
@@ -413,44 +424,118 @@ static void worker(const struct lock_ctx *ctx, const struct options *opts)
 			return;
 		}
 	}
+	// fprintf(stderr, "aaargh %d\n", me);
 }
 
-static void run_workers(struct lock_ctx *ctx, const struct options *opts)
+static void run_workers(struct lock_ctx *ctx, struct options *opts)
 {
-	pid_t child;
-	int i;
-	struct timespec t1, t2, t3, t4;
+	int i, wstat;
+	struct timespec t1, t2, t3, t4, tw;
+	long *results;
+	pid_t child,  *pids;
+	double sqsum;
 
+	pids = calloc(opts->workers, sizeof(*pids));
+	if (pids == NULL)
+		return;
+	results = mmap(NULL, opts->workers * sizeof(*results),
+		       PROT_READ|PROT_WRITE,
+		       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+	if (results == NULL) {
+		perror("mmap");
+		free(pids);
+		return;
+	}
+	memset(results, 0, sizeof(*results));
+
+	fflush(stdout);
 	clock_gettime(CLOCK_REALTIME, &t1);
 	for (i = 0; i < opts->workers; i++) {
 		child = fork();
 		if (child == -1) {
 			perror("fork");
+			free(pids);
+			munmap(results, opts->workers * sizeof(*results));
 			return;
 		}
-		if (child == 0) {
-			worker(ctx, opts);
+		else if (child == 0) {
+			struct sigaction sa;
+
+			free(pids);
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = &sig_handler;
+			if (sigaction(SIGINT, &sa, NULL) == -1) {
+				perror("sigaction");
+				exit(1);
+			}
+			worker(ctx, opts, &results[i]);
 			free_lock_ctx(ctx);
+			munmap(results, opts->workers * sizeof(*results));
 			exit(0);
 		}
+		else
+			pids[i] = child;
 	}
-	clock_gettime(CLOCK_REALTIME, &t2);
-	for (i = 0; i < opts->workers; i++) {
-		int wstat;
 
-		child = wait(&wstat);
-		if (i == 0)
-			clock_gettime(CLOCK_REALTIME, &t3);
+	clock_gettime(CLOCK_REALTIME, &t2);
+	tw.tv_sec = opts->seconds;
+	tw.tv_nsec = 0;
+	nanosleep(&tw, NULL);
+	clock_gettime(CLOCK_REALTIME, &t3);
+
+	for (i = 0; i < opts->workers; i++) {
+		siginfo_t si;
+		int r;
+
+		si.si_pid = 0;
+		r = waitid(P_PID, pids[i], &si,
+			   WEXITED|WNOHANG|WNOWAIT);
+		if (r == 0 && si.si_pid == 0) {
+//			fprintf(stderr, "shoot %d\n", pids[i]);
+			kill(pids[i], SIGINT);
+		}
 	}
+
+	while (child != -1) {
+		child = wait(&wstat);
+//		if (child != -1)
+//			fprintf(stderr, "%d died\n", child);
+	}
+
 	clock_gettime(CLOCK_REALTIME, &t4);
 	timespec_subtract(&t2, &t2, &t1);
 	timespec_subtract(&t4, &t4, &t3);
 	timespec_subtract(&t3, &t3, &t1);
-	fprintf(stderr,
-		"start time: %ld.%06lds, run time min: %ld.%06lds, stop time: %ld.%06lds\n",
-		t2.tv_sec, t2.tv_nsec/1000,
-		t3.tv_sec, t3.tv_nsec/1000,
-		t4.tv_sec, t4.tv_nsec/1000);
+
+	if ((t4.tv_sec + t4.tv_nsec/1.e9) / (t3.tv_sec + t3.tv_nsec/1.e9)
+	    >= 0.05)
+		fprintf(stderr,
+			"WARNING: run time %ld.%06lds, stop time: %ld.%06lds\n",
+			t3.tv_sec, t3.tv_nsec/1000,
+			t4.tv_sec, t4.tv_nsec/1000);
+
+	sqsum = opts->total = 0;
+	opts->maxi = -1;
+	opts->mini = LONG_MAX;
+	for (i = 0; i < opts->workers; i++) {
+		// fprintf(stderr, "worker %d: %ld\n", i, results[i]);
+		if (results[i] > opts->maxi)
+			opts->maxi = results[i];
+		if (results[i] < opts->mini)
+			opts->mini = results[i];
+		opts->total += results[i];
+		sqsum += results[i] * results[i];
+	}
+	munmap(results, opts->workers * sizeof(*results));
+
+	opts->avg = (double)opts->total / opts->workers;
+
+	if (opts->workers > 1)
+		opts->stddev = sqrt((sqsum -
+				     opts->workers * opts->avg * opts->avg)
+				    / (opts->workers - 1));
+	else
+		opts->stddev = 0;
 }
 
 enum {
@@ -470,7 +555,7 @@ static const struct _lock_type {
 };
 
 
-struct lock_ctx *get_ctx(const char *name) {
+static struct lock_ctx *get_ctx(const char *name) {
 	struct lock_ctx *ctx;
 	int type;
 
@@ -499,7 +584,7 @@ static void timediff(const struct tms *end, const struct tms *start,
 	*sys = (end->tms_cstime - start->tms_cstime) / ticks;
 }
 
-static double run_test(const struct options *opts, const char *tst, bool print)
+static long run_test(struct options *opts, const char *tst, bool print)
 {
 	struct tms tm_start, tm_end;
 	struct timespec ts_start, ts_end, ts_diff;
@@ -531,11 +616,12 @@ static double run_test(const struct options *opts, const char *tst, bool print)
 	timediff(&tm_end, &tm_start, ticks, &user, &sys);
 
 	if (print)
-		printf("%d %.3e %.3e %.3e\n", opts->workers,
-		       dt/opts->repeat, user/opts->repeat,
-		       sys/opts->repeat);
+		printf("%d %.3e %.3e %.3e %ld %ld %ld %.1f %.1f\n",
+		       opts->workers,
+		       dt, user, sys, opts->total, opts->mini, opts->maxi,
+		       opts->avg, opts->stddev);
 
-	return user + sys;
+	return opts->total;
 }
 
 static const int def_workers[] = { 10, 20, 50, 100, 200, 500, 1000 };
@@ -591,53 +677,12 @@ bad:
 	return -1;
 }
 
-static void calibrate_runtime(const char *tst, struct options *opts,
-			      double tgt)
-{
-	double calib;
-	double target = 0.5;
-
-	// if target is too small, chances are we have 0 ticks
-	for (calib = run_test(opts, tst, false);
-	     calib < target / 2 || calib > target * 2;
-	     calib = run_test(opts, tst, false)) {
-		int rp = opts->repeat;
-		double fac;
-
-		if (calib < 0) {
-			fprintf(stderr, "error in run_test\n");
-			return;
-		}
-		fac = target / (calib + 1.e-6);
-		if (fac < 0.1)
-			fac = 0.1;
-		else if (fac > 10)
-			fac = 10;
-		opts->repeat = rint(opts->repeat * fac);
-		// printf("calib=%.3e %.3e %d\n", calib, fac, opts->repeat);
-		if (opts->repeat <= MIN_REPEAT) {
-			opts->repeat = MIN_REPEAT;
-			break;
-		}
-		if (rp == opts->repeat)
-			break;
-		//fprintf(stderr, "calib: %d %f %f => %d\n",
-		//	rp, target, calib, opts->repeat);
-	}
-
-	//fprintf(stderr, "final: %f %f => %d\n",
-	//	target, calib, opts->repeat);
-	opts->repeat = rint(opts->repeat * tgt / target);
-	if (opts->repeat < MIN_REPEAT)
-		opts->repeat = MIN_REPEAT;
-}
-
 int main(int argc, char *const argv[])
 {
 	struct options opts = {
 		.idle = IDLE,
 		.busy = BUSY,
-		.repeat = 0,
+		.seconds = SECONDS,
 		.workers = 0,
 	};
 	int opt, i;
@@ -647,7 +692,7 @@ int main(int argc, char *const argv[])
 	do {
 		char *e;
 
-		opt = getopt(argc, argv, "i:b:w:r:");
+		opt = getopt(argc, argv, "i:b:w:t:");
 		switch (opt) {
 		case 'i':
 			opts.idle = strtol(optarg, &e, 10);
@@ -661,9 +706,9 @@ int main(int argc, char *const argv[])
 				goto opt_err;
 			opts.busy *= 1000;
 			break;
-		case 'r':
-			opts.repeat = strtol(optarg, &e, 10);
-			if (*e != '\0' || opts.repeat <= 0)
+		case 't':
+			opts.seconds = strtol(optarg, &e, 10);
+			if (*e != '\0' || opts.seconds <= 0)
 				goto opt_err;
 			break;
 		case 'w':
@@ -686,14 +731,9 @@ int main(int argc, char *const argv[])
 		goto opt_err;
 
 	opts.workers = workers[0];
-	if (opts.repeat == 0) {
-		opts.repeat = REPEAT;
-		calibrate_runtime(argv[optind], &opts,
-				  nworkers <= 1 ? 1 : 0.01);
-	}
 
 	printf("\n\n# %s %ld %ld %d\n", argv[optind],
-	       opts.busy/1000, opts.idle/1000, opts.repeat);
+	       opts.busy/1000, opts.idle/1000, opts.seconds);
 
 	for (i = 0; i < nworkers; i++) {
 		opts.workers = workers[i];
@@ -704,11 +744,11 @@ int main(int argc, char *const argv[])
 
 opt_err:
 	fprintf(stderr,
-		"usage: %s -i <idle-us> -b <busy-us> -w <workers> -r <repeat> test\n"
+		"usage: %s -i <idle-us> -b <busy-us> -w <workers> -t <seconds> test\n"
 		"   busy-us: time to hold the lock (negative: busy-wait)\n"
 		"   idle-us: time to sleep before locking again\n"
 		"   workers: ':'-separated list of thread counts, e.g. 10:20:30\n"
-		"   repeat:  number of loops, will be calibrated by default\n",
+		"   seconds:  number of seconds for each test\n",
 		argv[0]);
 	fprintf(stderr, "available tests: %s", lock_types[0].name);
 	for (i = 1; i < _N_LOCK_TYPES; i ++)
