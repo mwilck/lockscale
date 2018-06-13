@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <time.h>
 #include <math.h>
+#include <signal.h>
 #include "spookyhash_api.h"
 
 /*
@@ -309,7 +310,13 @@ static int timespec_subtract (struct timespec *result,
 	return x->tv_sec < y->tv_sec;
 }
 
-static __attribute__((unused)) void busywait(long ns)
+static bool stop = false;
+void sig_handler(int _unused)
+{
+	stop = true;
+}
+
+static int busywait(long ns)
 {
 	struct timespec until, now, diff;
 	int done;
@@ -324,7 +331,14 @@ static __attribute__((unused)) void busywait(long ns)
 	do {
 		clock_gettime(CLOCK_REALTIME, &now);
 		done = timespec_subtract(&diff, &until, &now);
-	} while (!done);
+	} while (!done && !stop);
+
+	if (done)
+		return 0;
+	else {
+		errno = EINTR;
+		return -1;
+	}
 }
 
 static struct lock_ctx *new_lock_ctx(const struct lock_ops *ops)
@@ -359,7 +373,7 @@ static void worker(const struct lock_ctx *ctx, const struct options *opts)
 {
 	static const char NAME[] = "test du sepp";
 
-	int i;
+	int i, n, rc;
 	const struct timespec wt = {
 		.tv_sec = opts->idle / BILLION,
 		.tv_nsec = opts->idle % BILLION,
@@ -368,20 +382,36 @@ static void worker(const struct lock_ctx *ctx, const struct options *opts)
 		.tv_sec = opts->busy / BILLION,
 		.tv_nsec = opts->busy % BILLION,
 	};
-	struct timespec now;
-	// pid_t me = getpid();
+	pid_t me = getpid();
 
-	for (i = 0; i < opts->repeat;  i++) {
-		ctx->ops->lock(ctx->ctx, NAME, true);
-		clock_gettime(CLOCK_REALTIME, &now);
-		//printf("%d: %d: %ld.%06ld\n", me, i,
-		//       now.tv_sec, now.tv_nsec/1000);
+	for (i = 0, n = 0; i < opts->repeat && !stop;  i++) {
+		if (ctx->ops->lock(ctx->ctx, NAME, true) == -1) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "%s(%d): %s in lock\n", __func__, me,
+			       strerror(errno));
+			return;
+		}
+		n++;
 		if (opts->busy < 0)
-			busywait(-opts->busy);
+			rc = busywait(-opts->busy);
 		else
-			nanosleep(&bwt, NULL);
-		ctx->ops->lock(ctx->ctx, NAME, false);
-		nanosleep(&wt, NULL);
+			rc = nanosleep(&bwt, NULL);
+		if (rc == -1) {
+			ctx->ops->lock(ctx->ctx, NAME, false);
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "%s(%d): %s in busy\n", __func__, me,
+			       strerror(errno));
+			return;
+		}
+		if (nanosleep(&wt, NULL) == -1) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "%s(%d): %s in idle\n", __func__, me,
+				strerror(errno));
+			return;
+		}
 	}
 }
 
