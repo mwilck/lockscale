@@ -1,3 +1,9 @@
+/*
+ * (c) 2018 Martin Wilck, SUSE Linux GmbH
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #define _GNU_SOURCE 1
 #include <sys/stat.h>
 #include <sys/types.h>
