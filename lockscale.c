@@ -46,7 +46,7 @@ struct lock_ctx {
 	const struct lock_ops *ops;
 };
 
-#define FCNTL_OPEN_DIR "/run/lock/mw"
+#define FCNTL_OPEN_DIR "/run/lockscale"
 
 struct fcntl_open_lock {
 	int dirfd;
