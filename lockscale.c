@@ -28,8 +28,7 @@
 #include "spookyhash_api.h"
 
 /*
- * gcc -Wall -Wpedantic -I/mnt/git/spookyhash/src -g -O2 -o /tmp/ls lockscale.c /mnt/git/spookyhash/build/bin/Release/libspookyhash.a -lm
- */
+ *  */
 
 #define SECONDS 10
 #define BUSY 1000000L

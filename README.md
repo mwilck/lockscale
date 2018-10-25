@@ -5,12 +5,9 @@
 **lock-algo** is the algorithm used for locking; either `flock`, `fcntl`, or
 `sysv`.
 
- * `fcntl`: workers use fcntl(..., `F_OFD_SETLKW`, ...),
- * `flock`: workers use flock(..., LOCK_EX),
- * `sysv`: workers use SysV semaphores. This is not a real by-file
-   lock. Instead it uses a semaphore set with the largest possible power-of-2 
-   number of semaphores supported by the system (typically 16384), and a 
-   hash function to map a file name to a semaphore index.
+ * `fcntl`: workers use `fcntl(..., F_OFD_SETLKW, ...)`,
+ * `flock`: workers use `flock(..., LOCK_EX)`,
+ * `sysv`: workers use SysV semaphores.
  
 ## Options
 
@@ -75,9 +72,28 @@ The program tests only basic locking of entire files. Actually, the file
 being locked is a 0-byte file. No testing of separate or overlapping byte
 ranges is performed.
 
+### "sysv" locking algorithm
+
+This locking algorithm is not a real per-file lock.
+Instead it uses a semaphore set with the largest possible power-of-2 
+number of semaphores supported by the system (typically 16384), and a 
+hash function to map a file name to a semaphore index. Thus it can be expected
+to work *almost* like a per-file lock as long as no more than ~1000
+files are being locked (beyond that, hash collisions would become 
+likely - I haven't done the math). For a single file, as in this test,
+it's perfectly usable. Of course, byte ranges are not supported. 
+It serves mostly as a reference for the other algorithms, because the
+semaphore implementation in the kernel is very well optimized. Indeed,
+I haven't observed any scaling issues with `sysv` with this program.
+
 ## Building
 
-The program needs to be compiled and liked with [spookyhash][2].
+The program needs to be compiled and liked with [spookyhash][2]. A sample
+compile command line would look like this:
+
+    cc -Wall -Wpedantic -I$HOME/spookyhash/src -g -O2 \
+	   -o lockscale lockscale.c \
+	   $HOME/spookyhash/build/bin/Release/libspookyhash.a -lm
 
 [1]: http://www.gnuplot.info/
-[2]: https://github.com/jibsen/spooky
+[2]: https://github.com/centaurean/spookyhash
